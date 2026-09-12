@@ -1,0 +1,4 @@
+interface:
+  display_name: "Sturdy PHPUnit Review"
+  short_description: "Audit PHPUnit tests for behavioral strength"
+  default_prompt: "Use $sturdy-phpunit-review to audit every PHPUnit test in this project against the sturdy-test criteria and recommend improvements."
