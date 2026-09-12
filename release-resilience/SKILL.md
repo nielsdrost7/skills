@@ -153,14 +153,14 @@ Write `~/projects/<project>/_notes/<slug>-release-resilience-YYYY-MM-DD.md`
 4. **What was changed** (if the run also applied fixes — it usually should
    NOT; this lens reports).
 
-Per the user's standing notes-file convention: the file is the deliverable;
+Per the standing notes-file convention: the file is the deliverable;
 the terminal reply is a short receipt (verdict + blocker count + file path +
 one line per blocker).
 
 ## Step 4 — SMART stories + build prompt (separate files)
 
-The user's established follow-up: each finding becomes a SMART user story,
-then a single build prompt implements them. Keep narrative and actionable in
+Standard follow-up: each finding becomes a SMART user story, then a single
+build prompt implements them. Keep narrative and actionable output in
 **separate files** (this matches the `handoff` skill's hard rule).
 
 - `~/projects/<project>/_notes/<slug>-prod-readiness-stories-YYYY-MM-DD.md`

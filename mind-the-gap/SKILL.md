@@ -13,9 +13,10 @@ validation passes, the write reaches the DB, and it blows up as an
 unhandled SQL 500 — often invisibly, because a modal-based create form
 frequently just looks "stuck" rather than showing an error. These bugs are
 individually cheap to fix and expensive to find one at a time, because they
-only surface when a real user happens to type the wrong thing. Origin: the
-`invoiceplane-2/ivplv2` project, after finding this exact bug shape five
-separate times across two sessions before building this.
+only surface when a real user happens to type the wrong thing. This skill
+was built after the same bug shape turned up repeatedly, one instance at a
+time, in a Laravel + Filament codebase — the reference implementation below
+comes from that project.
 
 **Rule: no static parsing of form field definitions.** Closures, conditional
 `->required(fn ($context) => ...)` rules, and shared form classes reused by
@@ -47,8 +48,8 @@ both audits' diffs, so duplicating it is how it silently drifts.
 
 ## Reference implementation (Laravel + Filament — copy this first)
 
-Built and running in `invoiceplane-2/ivplv2` (branch `ci/e2e-playwright-tests`).
-Treat these as the template to adapt, not just read:
+Built and running in a modular Laravel + Filament application. Treat these
+as the template to adapt, not just read:
 
 | File | Role |
 |---|---|
@@ -72,8 +73,9 @@ public const array KNOWN_GAPS = [
 
 1. **Backend first.** Get *some* form of the backend audit running and
    green before touching the frontend layer — it will find real bugs
-   immediately (ivplv2's first run found 9 in one pass; a follow-up found
-   4 more). Fix what it finds; do not loosen the check to make it pass.
+   immediately (the reference project's first run found 9 in one pass; a
+   follow-up found 4 more). Fix what it finds; do not loosen the check to
+   make it pass.
 2. **Export the schema JSON**, same shape as `ExportFormDbSchemaCommand`
    produces (table → columns with nullable/default/type/length → unique
    indexes → shared exceptions). This is the contract between the two
@@ -128,15 +130,14 @@ it's satisfied at *all* of them." A GitHub Actions workflow is just another
 place that discipline applies: sibling workflow files that should share a
 setup step are exactly as prone to drift as sibling forms are.
 
-Real incident, `invoiceplane-2/ivplv2`, 2026-08-26: `phpunit.yml` ran
-`php artisan test` with **no** Node/yarn/build step at all, while its sibling
-`quickstart.yml` built frontend assets first. A Feature test doing a real
-HTTP request into a Blade view that calls `@vite(...)` (`GuestQuoteViewTest`,
-via `resources/css/guest.css`) failed with "Unable to locate file in Vite
-manifest" as a direct result — a missing precondition, not a real test bug.
-This was found **reactively**, while chasing an unrelated test-failure
-report, exactly the failure mode this skill exists to prevent. Following the
-user's own "resolve one, resolve all" standard, the fix was two-fold:
+Example, from a Laravel monorepo's CI: `phpunit.yml` ran `php artisan test`
+with **no** Node/yarn/build step at all, while its sibling `quickstart.yml`
+built frontend assets first. A Feature test doing a real HTTP request into a
+Blade view that calls `@vite(...)` failed with "Unable to locate file in
+Vite manifest" as a direct result — a missing precondition, not a real test
+bug. This was found **reactively**, while chasing an unrelated test-failure
+report, exactly the failure mode this skill exists to prevent. The fix
+followed a "resolve one, resolve all" standard, and was two-fold:
 
 1. Fix the one instance found (add the missing `yarn build` step).
 2. Scan **every** sibling workflow for the same pattern before calling it

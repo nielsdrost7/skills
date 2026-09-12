@@ -5,20 +5,29 @@ description: "Identifies tests that check only response properties, not logic"
 
 ## Test-Honesty Skill: Specification
 
+This skill applies to both HTTP/Feature tests and pure Unit tests. Method
+names below (`assertResponseStatusCode`, `databaseSelect`, `seedInvoice`,
+...) are illustrative examples of a typical custom `TestCase` helper layer —
+substitute your own framework's equivalents (e.g. `$response->assertStatus()`,
+`$response->assertJsonFragment()`, `expectException()`). The included
+analyzer (see "Execution" below) detects assertions by *shape*, not by
+these exact names, so it works unmodified across projects with different
+helper conventions.
+
 ### 1. **Hollow Assertion Detection**
 
 Identifies tests that check only response properties, not logic:
 
 ```yaml
 Pattern: Response-only assertions
-❌ HOLLOW:
+HOLLOW:
   - $this->assertResponseStatusCode($response, 404)
   - $this->assertResponseBodyContains($response, 'error message')
-  
-✓ HONEST:
-  - $this->assertDatabaseMissing('table', $conditions)
+
+HONEST:
+  - $this->assertDatabaseMissing($table, $conditions)
   - $this->assertSame($expectedCount, $actualCount)
-  - $this->assertTrue($invoice->isPaid())
+  - $this->assertTrue($model->isPaid())
 ```
 
 **Detection rules:**
@@ -34,16 +43,16 @@ Detects missing state isolation assertions:
 ```yaml
 For error/rejection tests:
 MISSING: What should NOT happen?
-  ❌ Test doesn't verify no rows created
-  ❌ Test doesn't verify no API calls made
-  ❌ Test doesn't verify no files written
-  ❌ Test doesn't verify no state mutated
+  NOT: Test doesn't verify no rows created
+  NOT: Test doesn't verify no API calls made
+  NOT: Test doesn't verify no files written
+  NOT: Test doesn't verify no state mutated
 
 For success tests:
 MISSING: What SHOULD happen?
-  ❌ Test doesn't verify all rows created
-  ❌ Test doesn't verify related entities updated
-  ❌ Test doesn't verify audit trail recorded
+  NOT: Test doesn't verify all rows created
+  NOT: Test doesn't verify related entities updated
+  NOT: Test doesn't verify audit trail recorded
 ```
 
 **Detection rules:**
@@ -59,14 +68,14 @@ Identifies tests missing WHY verification:
 ```yaml
 Example: Payment rejection test
 CURRENT (shallow):
-  ✗ Only checks HTTP 404
+  NOT: Only checks HTTP 404
   
 NEEDED (honest):
-  ✓ Verify balance validation ran (pre-condition)
-  ✓ Verify no payment row created (guard worked)
-  ✓ Verify invoice amount unchanged (isolation)
-  ✓ Verify repeated request is safe (idempotency)
-  ✓ Verify authorization wasn't bypassed (gate)
+  YES: Verify balance validation ran (pre-condition)
+  YES: Verify no payment row created (guard worked)
+  YES: Verify invoice amount unchanged (isolation)
+  YES: Verify repeated request is safe (idempotency)
+  YES: Verify authorization wasn't bypassed (gate)
 ```
 
 **Detection rules:**
@@ -113,8 +122,14 @@ F. Boundary / Edge Cases
    - Max length strings
    - Type mismatches
 
-Score = (# categories touched / 6) × 100
-⚠️  WARN if score < 50% (test is too narrow)
+Score = (categories touched / categories applicable) × 100
+WARN if score < 50% (test is too narrow)
+
+Categories B, D, and E only apply when the test does something they could
+plausibly cover (I/O, a collaborator, shared state). A pure Unit test with
+none of that has those categories excluded from the denominator instead of
+scored as missing — a POPO/enum test isn't penalized for lacking a database
+side effect it structurally can't have.
 ```
 
 ### 5. **Test Structure Validation**
@@ -122,7 +137,7 @@ Score = (# categories touched / 6) × 100
 Verifies tests follow Arrange-Act-Assert with proper checkpoint placement:
 
 ```yaml
-❌ PROBLEM PATTERNS:
+PROBLEM PATTERNS:
 
 1. Arrange-only checkpoint:
    // Seeds 5 rows but never verifies them
@@ -136,7 +151,7 @@ Verifies tests follow Arrange-Act-Assert with proper checkpoint placement:
    $this->assertResponseStatusCode($response, 200);
    // Missing: state verification, side effects, relationships
 
-✓ GOOD PATTERN:
+YES: GOOD PATTERN:
 
 /* Arrange */
 $responseBefore = count($this->databaseSelect(...))
@@ -164,29 +179,29 @@ For each test type, generate suggested assertions:
 ```yaml
 For: Payment rejection tests
 Should include:
-  ☐ assertResponseStatusCode($response, 404)
-  ☐ assertDatabaseMissing('ip_payments', ['invoice_id' => $invoiceId])
-  ☐ assertDatabaseRow('ip_invoices', ['invoice_id' => $invoiceId], 
-      ['invoice_status_id' => $statusBefore])
-  ☐ assertDatabaseRow('ip_invoice_amounts', ['invoice_id' => $invoiceId],
-      ['invoice_balance' => $balanceBefore])
-  ☐ repeated request produces same result
-  ☐ message doesn't leak sensitive details
+  - [ ] assertResponseStatusCode($response, 404)
+  - [ ] assertDatabaseMissing('payments', ['invoice_id' => $invoiceId])
+  - [ ] assertDatabaseRow('invoices', ['id' => $invoiceId],
+      ['status' => $statusBefore])
+  - [ ] assertDatabaseRow('invoice_amounts', ['invoice_id' => $invoiceId],
+      ['balance' => $balanceBefore])
+  - [ ] repeated request produces same result
+  - [ ] message doesn't leak sensitive details
 
 For: Authorization gate tests
 Should include:
-  ☐ assertResponseStatusCode($response, 403 or 404)
-  ☐ assertNoApplicationError($response)
-  ☐ assertDatabaseMissing() for operation table
-  ☐ verify unauthorized user can't see the resource
-  ☐ verify data isolation (different user's data untouched)
+  - [ ] assertResponseStatusCode($response, 403 or 404)
+  - [ ] assertNoApplicationError($response)
+  - [ ] assertDatabaseMissing() for operation table
+  - [ ] verify unauthorized user can't see the resource
+  - [ ] verify data isolation (different user's data untouched)
 
 For: Concurrent request tests
 Should include:
-  ☐ Two requests race to claim resource
-  ☐ First wins, second rejected
-  ☐ No over-crediting or race condition
-  ☐ Both responses are deterministic (404 or success, never both)
+  - [ ] Two requests race to claim resource
+  - [ ] First wins, second rejected
+  - [ ] No over-crediting or race condition
+  - [ ] Both responses are deterministic (404 or success, never both)
 ```
 
 ### 7. **Test Coupling Detection**
@@ -202,10 +217,10 @@ HONEST: Each test stands alone
   TestB: $invoiceId = $this->seedInvoice()
   
 Detection rules:
-  ❌ Hardcoded IDs in tests
-  ❌ Assumptions about AUTO_INCREMENT values
-  ❌ Reliance on global state
-  ❌ Tests that don't call seed helpers
+  NOT: Hardcoded IDs in tests
+  NOT: Assumptions about AUTO_INCREMENT values
+  NOT: Reliance on global state
+  NOT: Tests that don't call seed helpers
 ```
 
 ### 8. **Comment Quality Check**
@@ -213,24 +228,24 @@ Detection rules:
 Verifies assertion comments explain the WHY:
 
 ```yaml
-❌ BAD (no context):
+BAD (no context):
 $this->assertSame(404, $response->statusCode());
 
-✓ GOOD (explains purpose):
+GOOD (explains purpose):
 $this->assertResponseStatusCode($response, 404);
-// Verify merchant client guard rejected nonexistent client before any side effects
+// Guard must reject an unknown client before any side effect runs
 
-❌ BAD (narrates the obvious):
+BAD (narrates the obvious):
 // Assert the response status code is 404
 $this->assertSame(404, $response->statusCode());
 
-✓ GOOD (explains business logic):
-// Gate must reject invalid merchant clients before INSERT IGNORE
-// to prevent duplicate_key_error when racing against concurrent requests
+GOOD (explains business logic):
+// Guard must reject an invalid client reference before the INSERT,
+// so a race between two requests can't create a duplicate row
 $this->assertResponseStatusCode($response, 404);
-$this->assertDatabaseMissing('ip_merchant_responses', [
+$this->assertDatabaseMissing('payments', [
     'invoice_id' => $invoiceId,
-    'merchant_client_id' => $invalidId,
+    'client_id' => $invalidId,
 ]);
 ```
 
@@ -245,7 +260,7 @@ Current test:
 Suggested improvements:
   
   1. Add state isolation assertions:
-     $this->assertDatabaseMissing('ip_merchant_responses', [...])
+     $this->assertDatabaseMissing('payments', [...])
      → Verifies no side effects occurred
   
   2. Add boundary value tests:
@@ -303,13 +318,13 @@ Detection: Are all scenarios tested? Or is test only verifying Scenario A?
 
 A test is honest when it verifies:
 
-1. ✓ **The guard works** (pre-conditions are checked)
-2. ✓ **The side effects happen (or don't)** (state changes verified)
-3. ✓ **The relationships stay intact** (no orphaned data)
-4. ✓ **The error is appropriate** (correct status code + message)
-5. ✓ **The operation is safe** (idempotent, atomic, no races)
-6. ✓ **Edge cases are handled** (boundary values, type mismatches)
-7. ✓ **The whole flow is tested** (not just happy path)
+1. YES: **The guard works** (pre-conditions are checked)
+2. YES: **The side effects happen (or don't)** (state changes verified)
+3. YES: **The relationships stay intact** (no orphaned data)
+4. YES: **The error is appropriate** (correct status code + message)
+5. YES: **The operation is safe** (idempotent, atomic, no races)
+6. YES: **Edge cases are handled** (boundary values, type mismatches)
+7. YES: **The whole flow is tested** (not just happy path)
 
 A test that only checks response status is a **performance metric**, not a **behavior test**. It tells you "the endpoint ran" but not "the endpoint did the right thing."
 
@@ -330,7 +345,7 @@ test-honesty <path-to-tests-directory> [--full-report]
 test-honesty tests/
 
 # Analyze a specific test file or directory
-test-honesty tests/Feature/Core/LetsPeppolFlowTest.php
+test-honesty tests/Feature/PaymentFlowTest.php
 
 # Generate full report with detailed suggestions
 test-honesty tests/ --full-report
@@ -345,4 +360,9 @@ The analyzer produces a markdown report showing:
 
 **Score Interpretation:**
 - **< 50%**: Test is hollow (only checks response, not logic)
-- **≥ 50%**: Test is honest (touches 3+ categories, verifies behavior)
+- **>= 50%**: Test is honest (touches most of its applicable categories, verifies behavior)
+
+A test's applicable-category count varies: an HTTP/Feature test touching the
+database is measured against all 6 categories, while a pure Unit test with no
+I/O is measured only against the categories that could apply to it (see
+"Assertion Diversity Scoring" above).

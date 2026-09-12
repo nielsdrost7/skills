@@ -2,16 +2,28 @@
 /**
  * Test-Honesty Analyzer
  *
- * Scans PHP test files and evaluates test quality across 6 assertion categories:
- * A. Business Logic Validation
+ * Scans PHP test files (PHPUnit-style — Feature or Unit) and scores each
+ * test's assertion diversity across six behavior-verification categories:
+ * A. Outcome Verification
  * B. State Isolation / Side Effects
- * C. Error Semantics
+ * C. Error / Exception Semantics
  * D. Data Integrity / Relationships
  * E. Idempotency / Concurrency
  * F. Boundary / Edge Cases
  *
- * Score = (categories_touched / 6) × 100
- * Warns if score < 50%
+ * All detection is pattern-based on assertion *shape*, not on any
+ * project-specific table name, variable name, or domain vocabulary — a
+ * suite of pure Unit tests over enums/value objects scores fairly
+ * alongside a suite of HTTP Feature tests against a database.
+ *
+ * Categories B, D and E only apply to a test that does something they
+ * could plausibly cover (I/O, a collaborator, shared state). A pure-logic
+ * Unit test that touches none of that has those categories excluded from
+ * its denominator rather than counted as missing — that's what stops a
+ * Unit-test-heavy suite from being misread as mostly hollow.
+ *
+ * Score = (applicable categories touched / applicable categories) x 100
+ * Warns if score < 50%.
  */
 
 class TestHonestyAnalyzer
@@ -21,71 +33,87 @@ class TestHonestyAnalyzer
     private $hollowTests = [];
     private $honestTests = [];
 
-    // Assertion patterns for each category
+    private const CATEGORY_NAMES = [
+        'A' => 'Outcome Verification',
+        'B' => 'State Isolation / Side Effects',
+        'C' => 'Error / Exception Semantics',
+        'D' => 'Data Integrity / Relationships',
+        'E' => 'Idempotency / Concurrency',
+        'F' => 'Boundary / Edge Cases',
+    ];
+
+    // Categories that require some form of I/O or shared state to mean
+    // anything. A pure-logic test that never touches any of that has
+    // these excluded from its denominator instead of scored as failing.
+    private const CONDITIONAL_CATEGORIES = ['B', 'D', 'E'];
+
+    // Assertion-shape patterns per category. Matched against the raw
+    // method body text, so they key on structure (an assertion comparing
+    // to a property/array access, a foreign-key-shaped identifier, an
+    // exception assertion) rather than any specific class, table, or
+    // variable name.
     private $patterns = [
         'A' => [
-            'assertDatabaseHas',
-            'assertDatabaseMissing',
-            'assertSame.*state',
-            'assertSame.*\$invoice',
-            'assertSame.*\$payment',
-            'assertSame.*\$client',
-            'assertEquals.*balance',
-            'assertTrue.*paid',
-            'assertFalse.*pending',
+            '/assertDatabaseHas\s*\(/',
+            '/assertSame\s*\(\s*\$\w+\s*,\s*\$\w+(->|\[)/',
+            '/assertEquals\s*\(\s*\$\w+\s*,\s*\$\w+(->|\[)/',
+            '/assertTrue\s*\(\s*\$\w+->\w+\s*\(/',
+            '/assertFalse\s*\(\s*\$\w+->\w+\s*\(/',
+            '/assertInstanceOf\s*\(/',
+            '/assertObjectEquals\s*\(/',
+            '/assertEqualsCanonicalizing\s*\(/',
         ],
         'B' => [
-            'assertDatabaseMissing',
-            'assertDatabaseCount',
-            'spy.*',
-            'Mock.*verify',
-            '\$countBefore.*\$countAfter',
-            'assertSame.*\$before.*\$after',
+            '/assertDatabaseMissing\s*\(/',
+            '/assertDatabaseCount\s*\(/',
+            '/shouldNotReceive\s*\(/',
+            '/->never\s*\(\s*\)/',
+            '/expects\s*\(\s*\$this->never\s*\(\s*\)\s*\)/',
+            '/\$\w*[Bb]efore\b[\s\S]{0,200}\$\w*[Aa]fter\b/',
+            '/assertNothingDispatched|assertNotDispatched|assertNotSent/',
         ],
         'C' => [
-            'assertResponseStatusCode',
-            'assertResponseStatus',
-            'assertStatus',
-            'assertResponseBodyContains',
-            'assertResponseBodyNotContains',
-            'assertStringContains.*response',
-            'assertStringNotContains.*response',
-            'assertEquals.*404',
-            'assertEquals.*403',
-            'assertEquals.*201',
+            '/assertStatus\s*\(/',
+            '/assertResponseStatusCode\s*\(/',
+            '/->assert(Ok|Created|NoContent|NotFound|Forbidden|Unauthorized|Unprocessable)\s*\(/',
+            '/expectException\w*\s*\(/',
+            '/assertThrows\s*\(/',
+            '/assertNull\s*\(/',
+            '/assertNotNull\s*\(/',
         ],
         'D' => [
-            'assertDatabaseRow',
-            'assertDatabaseHas',
-            'assertSame.*\$.*->.*_id',
-            'assertSame.*\$.*client_id',
-            'assertSame.*\$.*invoice_id',
-            'assertSame.*\$.*payment_id',
-            'assertEquals.*relationship',
+            '/assertDatabaseHas\s*\(/',
+            '/assertSame\s*\(\s*\$\w+\s*,\s*\$\w+->\w*_id\b/',
+            '/assertEquals\s*\(\s*\$\w+\s*,\s*\$\w+->\w*_id\b/',
+            '/->\w+_id\b[\s\S]{0,120}->\w+_id\b/',
+            '/assertSame\s*\(\s*\$\w+->\w+->\w+/', // nested relation/object graph
         ],
         'E' => [
-            'repeated request',
-            'twice',
-            'idempotent',
-            'race',
-            'concurrent',
-            'transaction',
-            'rollback',
-            'commit',
-            'second.*post',
-            'second.*request',
+            '/\bidempotent\b/i',
+            '/\bconcurrent\w*\b/i',
+            '/\brace\b/i',
+            '/\btwice\b/i',
+            '/repeated\s+(request|call)/i',
+            '/second\s+(post|request|call)/i',
+            '/\btransaction\w*\b/i',
+            '/\brollback\b/i',
         ],
         'F' => [
-            '0|zero',
-            '-1|negative',
-            '99999|nonexistent',
-            'null|empty string',
-            'boundary',
-            'edge case',
-            'invalid.*id',
-            'non-numeric',
+            '/\bzero\b/i',
+            '/\bnegative\b/i',
+            '/\bnonexistent\b/i',
+            '/\bboundary\b/i',
+            '/\bedge[\s_-]?case\b/i',
+            '/assertEmpty\s*\(/',
+            '/\binvalid\b/i',
+            '/non-?numeric/i',
         ],
     ];
+
+    // Signals that a test does I/O, touches shared state, or drives a
+    // collaborator through a double — used only to decide whether
+    // categories B/D/E are applicable, never to score a category itself.
+    private $ioSignalPattern = '/assertDatabase\w+\s*\(|Queue::|Mail::|Event::|Http::|Storage::|\$this->(post|get|put|patch|delete)\s*\(|Mockery::|->shouldReceive\s*\(|->expects\s*\(/';
 
     public function analyzeDirectory($directory)
     {
@@ -113,7 +141,7 @@ class TestHonestyAnalyzer
         );
 
         foreach ($iterator as $file) {
-            if ($file->getExtension() === 'php' && strpos($file->getFilename(), 'Test.php') !== false) {
+            if ($file->getExtension() === 'php' && str_ends_with($file->getFilename(), 'Test.php')) {
                 $files[] = $file->getRealPath();
             }
         }
@@ -126,49 +154,17 @@ class TestHonestyAnalyzer
         $content = file_get_contents($filePath);
         $relPath = str_replace(getcwd() . '/', '', $filePath);
 
-        // Extract test methods (handles return type hints and attributes)
-        $pattern = '/(?:#\[.*?\])?\s*public\s+function\s+(it_[a-z0-9_]+)\s*\([^)]*\)(?:\s*:\s*\w+)??\s*\{/';
+        // Matches PHPUnit `test*` methods and Pest-style `it_*` naming,
+        // with or without attributes / return type hints.
+        $pattern = '/(?:#\[.*?\]\s*)*public\s+function\s+(it_[a-z0-9_]+|test[A-Za-z0-9_]*)\s*\([^)]*\)(?:\s*:\s*\??\w+)?\s*\{/';
 
         if (preg_match_all($pattern, $content, $matches, PREG_OFFSET_CAPTURE)) {
             for ($i = 0; $i < count($matches[1]); $i++) {
                 $testName = $matches[1][$i][0];
                 $startPos = $matches[0][$i][1];
+                $testBody = $this->extractMethodBody($content, $startPos);
 
-                // Find the matching closing brace
-                $braceCount = 0;
-                $inString = false;
-                $stringChar = '';
-                $testBody = '';
-
-                // Start from the opening brace
-                for ($pos = strpos($content, '{', $startPos); $pos < strlen($content); $pos++) {
-                    $char = $content[$pos];
-
-                    // Handle strings
-                    if ($char === '"' || $char === "'") {
-                        if (!$inString) {
-                            $inString = true;
-                            $stringChar = $char;
-                        } elseif ($char === $stringChar && ($pos === 0 || $content[$pos - 1] !== '\\')) {
-                            $inString = false;
-                        }
-                    }
-
-                    if (!$inString) {
-                        if ($char === '{') {
-                            $braceCount++;
-                        } elseif ($char === '}') {
-                            $braceCount--;
-                            if ($braceCount === 0) {
-                                break;
-                            }
-                        }
-                    }
-
-                    $testBody .= $char;
-                }
-
-                $analysis = $this->analyzeTest($testName, $testBody);
+                $analysis = $this->analyzeTest($testBody);
                 $this->results[$relPath . '::' . $testName] = [
                     'file' => $relPath,
                     'method' => $testName,
@@ -177,7 +173,7 @@ class TestHonestyAnalyzer
 
                 $this->totalTests++;
 
-                if ($analysis['score'] < 50) {
+                if ($analysis['is_hollow']) {
                     $this->hollowTests[] = $testName;
                 } else {
                     $this->honestTests[] = $testName;
@@ -186,93 +182,97 @@ class TestHonestyAnalyzer
         }
     }
 
-    private function analyzeTest($testName, $testBody)
+    private function extractMethodBody($content, $startPos)
     {
-        $assertions = $this->extractAssertions($testBody);
-        $categoriesUsed = [];
+        $braceCount = 0;
+        $inString = false;
+        $stringChar = '';
+        $testBody = '';
 
-        // Determine which categories are represented
-        foreach (array_keys($this->patterns) as $category) {
-            foreach ($this->patterns[$category] as $pattern) {
-                if ($this->matchesPattern($assertions, $pattern)) {
-                    $categoriesUsed[] = $category;
-                    break;
+        for ($pos = strpos($content, '{', $startPos); $pos < strlen($content); $pos++) {
+            $char = $content[$pos];
+
+            if ($char === '"' || $char === "'") {
+                if (!$inString) {
+                    $inString = true;
+                    $stringChar = $char;
+                } elseif ($char === $stringChar && ($pos === 0 || $content[$pos - 1] !== '\\')) {
+                    $inString = false;
                 }
+            }
+
+            if (!$inString) {
+                if ($char === '{') {
+                    $braceCount++;
+                } elseif ($char === '}') {
+                    $braceCount--;
+                    if ($braceCount === 0) {
+                        break;
+                    }
+                }
+            }
+
+            $testBody .= $char;
+        }
+
+        return $testBody;
+    }
+
+    private function analyzeTest($testBody)
+    {
+        $assertionCount = $this->countAssertions($testBody);
+        $hasIO = (bool) preg_match($this->ioSignalPattern, $testBody);
+
+        $categoriesUsed = [];
+        $applicableCategories = [];
+        $notApplicable = [];
+
+        foreach ($this->patterns as $category => $patterns) {
+            $touched = $this->matchesAny($testBody, $patterns);
+            $isConditional = in_array($category, self::CONDITIONAL_CATEGORIES, true);
+
+            if ($isConditional && !$hasIO && !$touched) {
+                // Nothing in this test could demonstrate a side effect,
+                // a relationship, or a concurrency guarantee — exclude
+                // the category rather than penalize its absence.
+                $notApplicable[] = $category;
+                continue;
+            }
+
+            $applicableCategories[] = $category;
+            if ($touched) {
+                $categoriesUsed[] = $category;
             }
         }
 
-        $categoriesUsed = array_unique($categoriesUsed);
-        $score = (count($categoriesUsed) / 6) * 100;
+        $denominator = count($applicableCategories);
+        $score = $denominator > 0 ? (count($categoriesUsed) / $denominator) * 100 : 0;
 
         return [
-            'assertions' => count($assertions),
+            'assertions' => $assertionCount,
             'categories_used' => $categoriesUsed,
-            'categories_count' => count($categoriesUsed),
+            'categories_applicable' => $applicableCategories,
+            'categories_not_applicable' => $notApplicable,
             'score' => round($score, 1),
             'is_hollow' => $score < 50,
-            'assertion_list' => $assertions,
+            'is_unit_style' => !$hasIO,
         ];
     }
 
-    private function extractAssertions($testBody)
+    private function countAssertions($testBody)
     {
-        $assertions = [];
-
-        // Match all assertion calls - simpler pattern
-        if (preg_match_all('/\$this->assert\w+/', $testBody, $matches)) {
-            $assertions = array_unique($matches[0]);
-        }
-
-        // Look for specific assertion patterns
-        if (preg_match('/assertResponseStatusCode/', $testBody)) {
-            $assertions[] = 'assertResponseStatusCode';
-        }
-        if (preg_match('/assertResponseBodyContains/', $testBody)) {
-            $assertions[] = 'assertResponseBodyContains';
-        }
-        if (preg_match('/assertResponseBodyNotContains/', $testBody)) {
-            $assertions[] = 'assertResponseBodyNotContains';
-        }
-        if (preg_match('/assertDatabaseHas/', $testBody)) {
-            $assertions[] = 'assertDatabaseHas';
-        }
-        if (preg_match('/assertDatabaseMissing/', $testBody)) {
-            $assertions[] = 'assertDatabaseMissing';
-        }
-        if (preg_match('/assertDatabaseRow/', $testBody)) {
-            $assertions[] = 'assertDatabaseRow';
-        }
-        if (preg_match('/assertDatabaseCount/', $testBody)) {
-            $assertions[] = 'assertDatabaseCount';
-        }
-        if (preg_match('/assertSame|assertEquals/', $testBody)) {
-            $assertions[] = 'assertSame/assertEquals';
-        }
-        if (preg_match('/assertTrue|assertFalse/', $testBody)) {
-            $assertions[] = 'assertTrue/assertFalse';
-        }
-
-        // Also look for state comparisons (pre/post)
-        if (preg_match('/\$.*Before|countBefore|\$.*Before\s*=/', $testBody) &&
-            preg_match('/\$.*After|countAfter|\$.*After\s*=/', $testBody)) {
-            $assertions[] = '(pre/post state comparison)';
-        }
-
-        // Check for repeated requests
-        if (preg_match('/\$response\s*=.*\$response2|second.*request|POST.*POST/is', $testBody)) {
-            $assertions[] = '(repeated request)';
-        }
-
-        return array_unique(array_filter($assertions));
+        return preg_match_all('/\$this->assert\w+\s*\(|->assert[A-Z]\w*\s*\(|self::assert\w+\s*\(/', $testBody);
     }
 
-    private function matchesPattern($assertions, $pattern)
+    private function matchesAny($testBody, $patterns)
     {
-        $allText = implode(' ', $assertions);
-        $normalizedPattern = str_replace('|', '|', $pattern);
+        foreach ($patterns as $pattern) {
+            if (preg_match($pattern, $testBody)) {
+                return true;
+            }
+        }
 
-        return (bool) preg_match('/' . preg_quote($pattern, '/') . '/i', $allText) ||
-               preg_match('/' . $pattern . '/i', $allText);
+        return false;
     }
 
     private function generateReport()
@@ -283,20 +283,18 @@ class TestHonestyAnalyzer
         $report[] = "## Summary";
         $report[] = sprintf("- **Total Tests Analyzed**: %d", $this->totalTests);
         $report[] = sprintf("- **Hollow Tests** (score < 50%%): %d", count($this->hollowTests));
-        $report[] = sprintf("- **Honest Tests** (score ≥ 50%%): %d", count($this->honestTests));
-        $report[] = sprintf("- **Hollow Ratio**: %.1f%%", ($this->totalTests > 0) ? (count($this->hollowTests) / $this->totalTests * 100) : 0);
+        $report[] = sprintf("- **Honest Tests** (score >= 50%%): %d", count($this->honestTests));
+        $report[] = sprintf(
+            "- **Hollow Ratio**: %.1f%%",
+            $this->totalTests > 0 ? (count($this->hollowTests) / $this->totalTests * 100) : 0
+        );
         $report[] = "";
         $report[] = "## Detailed Results";
         $report[] = "";
 
-        // Group by file
         $fileGroups = [];
-        foreach ($this->results as $testId => $result) {
-            $file = $result['file'];
-            if (!isset($fileGroups[$file])) {
-                $fileGroups[$file] = [];
-            }
-            $fileGroups[$file][] = $result;
+        foreach ($this->results as $result) {
+            $fileGroups[$result['file']][] = $result;
         }
 
         foreach ($fileGroups as $file => $tests) {
@@ -305,29 +303,37 @@ class TestHonestyAnalyzer
 
             foreach ($tests as $result) {
                 $analysis = $result['analysis'];
-                $hollow = $analysis['is_hollow'] ? ' ⚠️ HOLLOW' : ' ✓ HONEST';
-                $report[] = sprintf("#### %s%s", $result['method'], $hollow);
-                $report[] = sprintf("- **Score**: %.1f%% (%d/%d categories)",
+                $verdict = $analysis['is_hollow'] ? ' [HOLLOW]' : ' [HONEST]';
+                $report[] = sprintf("#### %s%s", $result['method'], $verdict);
+                $report[] = sprintf(
+                    "- **Score**: %.1f%% (%d/%d applicable categories)",
                     $analysis['score'],
-                    $analysis['categories_count'],
-                    6
+                    count($analysis['categories_used']),
+                    count($analysis['categories_applicable'])
                 );
-                $report[] = sprintf("- **Categories Used**: %s",
-                    implode(', ', $analysis['categories_used']) ?: 'None'
+                $report[] = sprintf(
+                    "- **Categories Used**: %s",
+                    $analysis['categories_used'] ? implode(', ', $analysis['categories_used']) : 'None'
                 );
+                if ($analysis['categories_not_applicable']) {
+                    $report[] = sprintf(
+                        "- **Not Applicable**: %s (no I/O or side effects in this test)",
+                        implode(', ', $analysis['categories_not_applicable'])
+                    );
+                }
                 $report[] = sprintf("- **Assertions**: %d", $analysis['assertions']);
                 $report[] = "";
 
                 if ($analysis['is_hollow']) {
-                    $report[] = "**⚠️ Improvement Suggestions:**";
+                    $report[] = "**Improvement suggestions:**";
                     $report[] = "";
-
-                    $missing = $this->suggestMissingCategories($analysis['categories_used']);
-                    foreach ($missing as $category => $suggestion) {
-                        $report[] = sprintf("- **Add %s (Category %s)**: %s",
+                    $missing = array_diff($analysis['categories_applicable'], $analysis['categories_used']);
+                    foreach ($missing as $category) {
+                        $report[] = sprintf(
+                            "- **%s (Category %s)**: %s",
+                            self::CATEGORY_NAMES[$category],
                             $category,
-                            array_search($category, ['A', 'B', 'C', 'D', 'E', 'F']),
-                            $suggestion
+                            $this->suggestionFor($category)
                         );
                     }
                     $report[] = "";
@@ -337,41 +343,35 @@ class TestHonestyAnalyzer
 
         $report[] = "## Interpretation";
         $report[] = "";
-        $report[] = "**Score < 50%**: Test is **hollow** — checks response properties only, doesn't verify business logic.";
+        $report[] = "**Score < 50%**: Test is **hollow** — checks response shape or return type only, doesn't verify business logic.";
         $report[] = "";
-        $report[] = "**Score ≥ 50%**: Test is **honest** — touches 3+ assertion categories, verifies logic + state.";
+        $report[] = "**Score >= 50%**: Test is **honest** — touches most of its applicable assertion categories.";
         $report[] = "";
-        $report[] = "### Categories:";
-        $report[] = "- **A**: Business Logic (database state, computed values)";
-        $report[] = "- **B**: State Isolation (side effects prevented, counts unchanged)";
-        $report[] = "- **C**: Error Semantics (HTTP status, message content)";
-        $report[] = "- **D**: Data Integrity (relationships, foreign keys)";
-        $report[] = "- **E**: Idempotency (repeated requests safe)";
-        $report[] = "- **F**: Boundary Cases (0, negative, nonexistent IDs, null)";
+        $report[] = "A category marked *not applicable* means the test has no I/O, collaborator, or shared state for that category to describe — for example, a pure Unit test over an enum has no database row to leave untouched, so State Isolation is excluded rather than counted against it.";
+        $report[] = "";
+        $report[] = "### Categories";
+        $report[] = "- **A — Outcome Verification**: asserts a computed or persisted value, not just that something ran.";
+        $report[] = "- **B — State Isolation**: proves side effects were prevented or scoped (unchanged rows, uncalled collaborators).";
+        $report[] = "- **C — Error / Exception Semantics**: the failure itself is asserted (status code, exception type, error payload).";
+        $report[] = "- **D — Data Integrity**: relationships and foreign keys stayed consistent.";
+        $report[] = "- **E — Idempotency / Concurrency**: repeating or racing the operation is safe.";
+        $report[] = "- **F — Boundary / Edge Cases**: zero, negative, nonexistent, null, or otherwise atypical input.";
 
         return implode("\n", $report);
     }
 
-    private function suggestMissingCategories($used)
+    private function suggestionFor($category)
     {
-        $all = ['A', 'B', 'C', 'D', 'E', 'F'];
-        $missing = array_diff($all, $used);
-
         $suggestions = [
-            'A' => 'Add assertDatabaseHas() or assertSame() to verify state changed correctly',
-            'B' => 'Add assertDatabaseMissing() or count checks to verify no side effects',
-            'C' => 'Add assertResponseStatusCode() or assertResponseBodyContains()',
-            'D' => 'Add assertDatabaseRow() to verify relationships/foreign keys intact',
-            'E' => 'Test repeated request: $response2 = $this->post(...); assertResponseStatusCode($response2, 404);',
-            'F' => 'Add boundary tests: nonexistent ID (99999), invalid ID (non-numeric), ID=0, null values',
+            'A' => 'Assert against a value the code actually computed or persisted (e.g. assertSame($expected, $result->attribute)), not just that the call succeeded.',
+            'B' => 'Add an assertion that proves no unintended side effect occurred — assertDatabaseMissing(...), a "never called" mock expectation, or a before/after comparison.',
+            'C' => 'Assert on the failure itself — the HTTP status/error payload, or the thrown exception\'s type and message.',
+            'D' => 'Assert a relationship or foreign-key value to prove referential integrity held after the operation.',
+            'E' => 'If repeating or racing the operation should be safe, add a test that calls it twice (or concurrently) and asserts the same safe outcome both times.',
+            'F' => 'Add a boundary-value case: zero, negative, a nonexistent id, or a null/empty input.',
         ];
 
-        $result = [];
-        foreach ($missing as $cat) {
-            $result[$cat] = $suggestions[$cat] ?? 'Add missing assertion type';
-        }
-
-        return $result;
+        return $suggestions[$category] ?? 'Add an assertion covering this category.';
     }
 }
 
@@ -379,16 +379,14 @@ class TestHonestyAnalyzer
 if (php_sapi_name() === 'cli') {
     $path = isset($argv[1]) ? $argv[1] : './tests';
 
-    // Handle single file
     if (is_file($path)) {
         $analyzer = new TestHonestyAnalyzer();
         echo $analyzer->analyzeFile($path) . "\n";
     } elseif (is_dir($path)) {
         $analyzer = new TestHonestyAnalyzer();
-        $report = $analyzer->analyzeDirectory($path);
-        echo $report . "\n";
+        echo $analyzer->analyzeDirectory($path) . "\n";
     } else {
-        echo "Error: Path not found: $path\n";
+        fwrite(STDERR, "Error: Path not found: $path\n");
         exit(1);
     }
 }

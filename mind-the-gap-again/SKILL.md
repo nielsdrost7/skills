@@ -14,34 +14,33 @@ and never once submit without it. [[mind-the-gap]] catches "the rule
 doesn't exist anywhere." This catches "the rule exists and is proven
 server-side, but nothing proves the browser path to it still works."
 
-Origin: `invoiceplane-2/ivplv2`, 2026-08-22. Anchor example, hand-verified:
-`Modules/Invoices/Tests/Feature/InvoicesTest.php` has
-`it_fails_to_create_invoice_without_required_customer`.
-`Modules/Invoices/Tests/E2E/invoices.spec.js` only ever fills the customer
-field in — never once submits without it. A whole-codebase check (v1, since
-superseded — see below) found this wasn't isolated: 121 of 145 failure-path
-PHPUnit tests across all 8 modules had no PHPUnit-title-to-E2E-title match.
+Anchor example, hand-verified in a Laravel + Filament reference project:
+a PHPUnit test (`it_fails_to_create_invoice_without_required_customer`)
+proved the server-side rule, while the corresponding Playwright spec only
+ever filled the customer field in — never once submitting without it. A
+whole-codebase check (v1, since superseded — see below) found this wasn't
+isolated: 121 of 145 failure-path PHPUnit tests across all 8 modules had no
+matching E2E coverage.
 
 ## Version history — read this before reusing the wrong approach
 
 **v1 (abandoned): fuzzy title-matching.** Compare PHPUnit method names like
 `it_fails_to_create_X_without_required_Y` against Playwright test titles by
-keyword overlap. Found the scale of the problem, but the user's own
-critique killed it as the actual fix: **"a title that matches still isn't a
-test that works."** A title-matching report can't prove anything — it only
-proves two strings share words. Do not resurrect this as the primary
-mechanism; it's fine as a one-off discovery aid at most.
+keyword overlap. This found the scale of the problem but not a fix: a title
+that matches still isn't a test that works — a title-matching report can't
+prove anything, it only proves two strings share words. Do not resurrect
+this as the primary mechanism; it's fine as a one-off discovery aid at most.
 
-**v2 (built, working, current): schema-driven generation.** The user's
-insight that replaced it: *"The test for the backend looked at the
-requirements to get the form filled. The frontend tests can do the exact
-same thing."* Every required column is already known — it's the exact same
-`schema.json` fact mind-the-gap's backend audit exports (NOT NULL, no
-default). So: for every required column of every resource, open the real
-create form, fill in a fully valid submission for every OTHER required
-field, leave only the target field blank, submit for real, and assert the
-browser genuinely rejects it. No test-name matching anywhere — the backend
-fact and the frontend test target the same column directly.
+**v2 (built, working, current): schema-driven generation.** The backend
+audit already looks at the DB schema to know which fields are required;
+the frontend tests can do the exact same thing. Every required column is
+already known — it's the exact same `schema.json` fact mind-the-gap's
+backend audit exports (NOT NULL, no default). So: for every required column
+of every resource, open the real create form, fill in a fully valid
+submission for every OTHER required field, leave only the target field
+blank, submit for real, and assert the browser genuinely rejects it. No
+test-name matching anywhere — the backend fact and the frontend test target
+the same column directly.
 
 ## Where this lives (a deliberate, corrected decision)
 
@@ -74,8 +73,8 @@ each fails a submission differently:
    the **browser** blocks the submission itself via native constraint
    validation. No request ever reaches the server. Assert
    `el.checkValidity() === false` and a non-empty `el.validationMessage` —
-   the same mechanism `Modules/Core/Tests/E2E/admin-tax-rates.spec.js`
-   already established (commit `fc25764`).
+   the same mechanism an existing native-field E2E spec in this suite
+   already established.
 2. **Filament's custom JS-driven Select** (relationship fields — no native
    `<select>` at all, just a `<button role="combobox" id="form.X">`, no
    native `required` semantics to hook into): the request **does** reach
@@ -87,22 +86,22 @@ each fails a submission differently:
 Get this wrong and a test either can't fail (asserting a mechanism that
 never fires) or produces a false pass (finding *some* error on the page
 that isn't actually about the field under test). Both were real bugs hit
-while building this — see "Debugging gotchas" below.
+while building this — see "Debugging notes" below.
 
 ## The schema source
 
 `loadSchemaForModule(moduleName)` in `required-field-helpers.js` runs
 `php artisan mind-the-gap:export-schema` and filters to resources whose
 `resourceClass` starts with `Modules\<Name>\`. It **always** shells out
-through Docker —
-`docker exec ivpldock-workspace-1 sh -c "cd /var/www/... && php artisan ..."`
-— never bare host `php artisan`, not even as a first attempt. Explicit
-correction from the user after an earlier draft tried bare-then-fallback:
-*"php artisan without Docker can ONLY reach the database IF the database
-host is 127.0.0.1 — that's why we're using Docker, because that keeps
-working no matter what and doesn't take time to debug."* Don't
-"optimize" this back to a try/fallback — it isn't an optimization, it's
-reintroducing a debugging trap for zero benefit.
+through the app's own container —
+`docker exec <workspace-container> sh -c "cd /var/www/... && php artisan ..."`
+— never a bare host `php artisan`, not even as a first attempt. Bare-host
+`php artisan` only reaches the database when the configured DB host happens
+to resolve to `127.0.0.1`; on any other setup it silently can't connect.
+Running through the container that already has the correct DB host
+configured avoids that failure mode entirely, so don't "optimize" this into
+a try-bare-host-then-fall-back-to-Docker path — that reintroduces the exact
+debugging trap this avoids, for no benefit.
 
 ## Why storageState auth matters here (a real, measured fix, not a guess)
 
@@ -110,16 +109,16 @@ Early versions logged in fresh for every single generated test (matching
 how the `testrunner` prototype had always done it). That produced
 consistent, non-deterministic login-timeout flake — 1-2 different tests
 per run failing on the shared login step under the load of ~20+ fresh
-serial logins, always recovering on retry. Moving these tests into
-ivplv2's real E2E suite fixed this **as a side effect**, not a deliberate
-fix: that suite's `global-setup.js` logs in **once** for the entire run and
-reuses `auth.json` storageState. Zero login-related flake since, and
-~750ms-1s per test instead of several seconds. If you ever build a
-schema-driven generator like this as a standalone tool again (not
+serial logins, always recovering on retry. Moving these tests into the
+target app's own E2E suite fixed this **as a side effect**, not a
+deliberate fix: that suite's `global-setup.js` logs in **once** for the
+entire run and reuses `auth.json` storageState. Zero login-related flake
+since, and ~750ms-1s per test instead of several seconds. If you ever build
+a schema-driven generator like this as a standalone tool again (not
 integrated into the target app's own suite), give it a shared-login
 mechanism from the start — don't repeat the fresh-login-per-test mistake.
 
-## Debugging gotchas hit building this (useful if the mechanism ever needs re-deriving for a DOM change)
+## Debugging notes (useful if this mechanism needs re-deriving after a DOM change)
 
 - **Two "Create" buttons can match one accessible-name query.** Filament
   renders a small inline "create a related record" quick-add button next
@@ -156,11 +155,11 @@ mechanism from the start — don't repeat the fresh-login-per-test mistake.
 
 Both this skill and [[mind-the-gap]] exist because the same bug class kept
 getting found **reactively** — while debugging something unrelated — instead
-of by a deliberate, upfront pass. User correction, `invoiceplane-2/ivplv2`,
-2026-08-26, after a CI-workflow precondition gap (see [[mind-the-gap]]'s "A
-second gap class" section) was found this same reactive way: *"I noticed
-that you're seeing a lot of gaps, but you're only seeing them afterwards or
-while trying to resolve other problems... find them now, now, now."*
+of by a deliberate, upfront pass. A CI-workflow precondition gap (see
+[[mind-the-gap]]'s "A second gap class" section) was found this same
+reactive way once too, which is what prompted turning this into a standing
+rule rather than a one-off cleanup: find these gaps proactively, at the
+start of the task, not after a failure forces the issue.
 
 Concretely: when starting any task that touches a Filament resource, a form,
 a CI workflow, or anything else these two skills' mechanisms cover, run the
