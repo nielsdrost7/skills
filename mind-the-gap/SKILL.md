@@ -1,6 +1,6 @@
 ---
 name: mind-the-gap
-description: Build a permanent, whole-codebase audit that catches "form field doesn't match its DB column constraint" bugs before a user does — both the backend form schema and the actually-rendered frontend DOM, cross-checked against real database introspection, not static source parsing. Also covers the general "N places must share a required precondition, verify they actually do" gap class (e.g. CI workflow steps) — see "A second gap class" section below.
+description: Build a permanent, whole-codebase audit that catches "form field doesn't match its DB column constraint" bugs before a user does — both the backend form schema and the actually-rendered frontend DOM, cross-checked against real database introspection, not static source parsing. Also covers the general "N places must share a required precondition, verify they actually do" gap class (e.g. CI workflow steps) — see "A second gap class" section below. And a third: a field can pass every validation rule and still never reach the database, because the service layer between the form and the write silently drops it or reads the wrong key — see "A third gap class" below.
 ---
 
 # Skill: mind-the-gap
@@ -184,6 +184,107 @@ don't assume the first one you check is representative" audit. Adapt the
 mechanism (a small script/test that parses and compares the real files),
 not just the one worked example above.
 
+## A third gap class: silent field-drop between the form and the database
+
+A field passes every validation rule the first two gap classes exist to
+audit — required, unique, max-length all correctly matched to the DB column
+— submission succeeds with **no error anywhere**, and the value still never
+reaches the database, because the *service layer* sitting between the form
+and the DB write silently drops it or reads it under the wrong key. This is
+not a schema-mismatch bug (the column and the form agree on shape) and not
+a missing-required-test gap (nothing was ever supposed to fail) — it's a
+data-loss bug hiding in plain sight, because a successful save *looks*
+identical whether or not the value actually landed.
+
+Two concrete shapes, both confirmed real in one PR in a Laravel + Filament
+codebase:
+
+1. **Key omitted entirely.** `TextInput::make('title')` on the form,
+   `EmailTemplateService::createEmailTemplate()` writes
+   `'title' => $data['title']` — but the sibling `updateEmailTemplate()`'s
+   explicit `$model->update([...])` array never mentions `title` at all.
+   Create works, update silently discards every rename.
+2. **Key name mismatch.** `MarkdownEditor::make('notes')` is the field the
+   form actually submits, but the service reads `$data['summary'] ?? null`
+   — a key that never exists in the submitted array — so the real DB column
+   (`summary`) saves `null` on *every* save, create and update alike,
+   regardless of what the user typed. Same shape, confirmed independently
+   on Invoices (`notes`→`summary`, `invoice_terms`→`terms`), Quotes
+   (`notes`→`summary`), and Payments (`note`→`notes`, a singular/plural
+   mismatch).
+
+A third, related field (`project_number`, `payment_number`) was missing
+from **both** create and update — not a create/update asymmetry, just dead
+on arrival since the feature was built.
+
+### Detection: static candidates, dynamic proof — never skip the second half
+
+Finding *candidates* is cheap: for a given resource, diff the set of real
+field names the form schema declares (excluding `Placeholder::make()`
+display-only fields, and a `Repeater`'s own line-item sub-fields, which are
+persisted through separate, already-visible logic) against the literal
+array keys in that resource's `create*()`/`update*()` service methods. Read
+the methods directly — this is exactly the kind of small, deterministic
+source region the "no static parsing" rule's spirit doesn't forbid reading,
+since these whitelist arrays are plain literal PHP arrays, not evaluated
+closures or conditional rules.
+
+**But a static-only diff produces false positives, and reporting one as a
+bug without verifying it is itself a repeat of this skill's core mistake.**
+Confirmed in the same session: `numbering_id` looked exactly like this bug
+via static diffing — present on the form, absent from
+`QuoteService::updateQuote()`'s whitelist — but a real Livewire round-trip
+test (fill the field, save, `assertDatabaseHas`) passed on the very first
+run. Filament's `Select::make('numbering_id')->relationship(...)` was
+already associating the value directly onto the Eloquent model before the
+service's explicit array ever ran, so the field persisted correctly through
+a path the static diff couldn't see. **Every static candidate must be
+confirmed by an actual save-and-read-back test before being treated as a
+bug or fixed** — the static pass narrows where to look, it does not decide
+what's broken.
+
+### The permanent audit: one round-trip test per field, generated from the same static diff
+
+For every field that survives the static diff (i.e., every field the static
+pass could not immediately explain away), generate one test: submit a
+distinctive marker value for that field through the real create *and* real
+update Livewire path, then `assertDatabaseHas` the actual column with that
+exact value. A field that fails this is the genuine bug; a field that
+passes clears the static finding and becomes a permanent regression guard
+either way — the same "keep it, it now proves correct behavior" outcome
+`numbering_id`'s test became here.
+
+### Don't stop at the happy path — the edges are the same discipline, one level down
+
+A single "set it, verify it persists" test proves the fix, but repeats the
+exact one-sided-test shape that let the *original* bug ship silently in the
+first place — the same lopsidedness "A second gap class" describes for CI
+workflows applies here, one level down, at a single field's test coverage.
+Once a field's round-trip test exists, complete it symmetrically:
+
+- If the field is `->required()` (or the DB-equivalent constraint): assert
+  the **update** path rejects a blanked-out value the same way the create
+  path does — see [[mind-the-gap-again]]'s note on this, since that skill's
+  generator historically only opened the *create* form. `title` on
+  `EmailTemplate` had a create-side required test and no update-side one;
+  writing the missing test didn't find a second bug (the shared schema
+  already validated both paths correctly) — but the coverage gap was real,
+  and closing it now is exactly what stops a genuine future regression on
+  the edit path from shipping unnoticed.
+- If the field has a length/format boundary: assert a value one past the
+  boundary is rejected, not just that the DOM attribute matches (the
+  frontend layer above checks the *attribute*; this checks the *behavior*
+  it's supposed to produce).
+- If the field is optional: assert clearing an existing value back to
+  `null`/empty on update actually nulls the column — the literal inverse of
+  the round-trip "set" test, and the direction most likely to be missed
+  because it's less visually obvious than "type something, see it save."
+
+None of these three edge tests is guaranteed to find a second bug — most
+won't, the same way most of these ran green on the first try. Write them
+anyway; the point is closing the coverage gap the first pass leaves, not
+fishing for more bugs specifically.
+
 ## Anti-patterns to avoid when extending this
 
 - Adding an entry to the known-exceptions list to make a failing audit
@@ -198,3 +299,14 @@ not just the one worked example above.
   CI-gated permanent test. A report that nobody re-runs decays back into
   exactly the "find bugs one at a time, after the fact" problem this skill
   exists to solve.
+- Reporting (or fixing) a static form-vs-service field-drop candidate
+  without the dynamic round-trip test confirming it. Skipping straight from
+  "this key is missing from the whitelist array" to "this is a bug" is
+  exactly the false-positive `numbering_id` turned out to be — the fix
+  belongs on the finding that actually reproduces, not the one that merely
+  looks suspicious on paper.
+- Writing only the "set the value, verify it persists" test for a
+  field-drop fix and calling the field done. That's the same one-sided-test
+  shape the original bug exploited — see "Don't stop at the happy path"
+  above. A fix without its required/boundary/clear-to-null siblings is an
+  unfinished fix, not a smaller one.

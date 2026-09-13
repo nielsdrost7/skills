@@ -1,6 +1,6 @@
 ---
 name: mind-the-gap-again
-description: Generate real frontend tests that prove the browser reaches every backend-proven required-field failure — driven by the same DB-schema ground truth mind-the-gap already exports, not fuzzy PHPUnit-title-to-E2E-title matching
+description: Generate real frontend tests that prove the browser reaches every backend-proven required-field failure, on both the create AND the edit form — driven by the same DB-schema ground truth mind-the-gap already exports, not fuzzy PHPUnit-title-to-E2E-title matching
 ---
 
 # Skill: mind-the-gap-again
@@ -41,6 +41,34 @@ submission for every OTHER required field, leave only the target field
 blank, submit for real, and assert the browser genuinely rejects it. No
 test-name matching anywhere — the backend fact and the frontend test target
 the same column directly.
+
+**v2 had its own gap: it only ever opened the create form.** Confirmed the
+hard way in a later session, on a *different* skill's finding: a required
+`title` field on an EmailTemplate resource had a create-side PHPUnit test
+(`it_fails_to_create_email_template_without_required_title`) and, until it
+was pointed out, no update-side equivalent at all
+(`it_fails_to_update_an_email_template_without_required_title`) — the exact
+same create/update asymmetry this skill exists to catch on the *frontend*
+layer, except it was v2's own *backend*-test generation logic that had
+never been extended to the edit form either. Filament's edit and create
+pages commonly share the same underlying schema class, so `->required()`
+usually *does* already hold on both paths — writing the missing test found
+no second bug here — but "usually holds" is precisely the kind of assumed-
+not-verified gap this skill's whole premise rejects everywhere else. A
+resource whose edit form uses a genuinely different schema (a conditional
+`->required(fn ($context) => $context === 'create')`, or a separate Edit-
+specific schema class entirely) would fail exactly the way the original
+anchor bug did, silently, and nothing here would have caught it.
+
+**The fix, concretely: generate two tests per required column, not one.**
+Alongside the existing create-form test, open the **edit** form for an
+existing real record, blank the target required field, submit, and assert
+the same rejection (native `checkValidity()` for HTML-backed fields, the
+Livewire validation-error element for custom Selects — both mechanisms
+below apply unchanged to an edit form, nothing about them is create-form-
+specific). Do this for the backend PHPUnit generation *and* the frontend
+Playwright generation — the gap was symmetric across both layers, so the
+fix must be too.
 
 ## Where this lives (a deliberate, corrected decision)
 
@@ -160,6 +188,16 @@ of by a deliberate, upfront pass. A CI-workflow precondition gap (see
 reactive way once too, which is what prompted turning this into a standing
 rule rather than a one-off cleanup: find these gaps proactively, at the
 start of the task, not after a failure forces the issue.
+
+The create-vs-edit-form gap in this skill's own v2 (above) is the same
+lesson recurring one layer up: even a skill built specifically to close a
+reactively-found gap can itself have an untested edge, found the same
+reactive way, by someone asking "did you test the inverse?" after the fact
+instead of the generator asking it of itself up front. See also
+[[mind-the-gap]]'s "A third gap class" (silent field-drop between a form
+and the database) and its "Don't stop at the happy path" section — the same
+principle, generalized past "is this field required" to "does this field's
+*value* actually survive the round trip, in every direction that matters."
 
 Concretely: when starting any task that touches a Filament resource, a form,
 a CI workflow, or anything else these two skills' mechanisms cover, run the
