@@ -358,6 +358,43 @@ The analyzer produces a markdown report showing:
 - Specific improvement suggestions for each hollow test
 - Category interpretation guide
 
+## Known Limitations
+
+The analyzer detects assertions by *shape* (which method was called, and
+roughly what it was called on) — it does not evaluate whether the value
+being asserted on is actually the right one. It can tell that a test
+checked *something* about a returned value; it cannot tell whether that
+something was sufficient to prove the value is correct.
+
+Concrete example, found by manual review after the analyzer scored the
+test "honest": a Peppol document-status test —
+
+```php
+public function it_gets_document_status(): void
+{
+    $status = $this->service->getDocumentStatus('DOC-123456');
+
+    $this->assertIsArray($status);
+    $this->assertArrayHasKey('status', $status);
+}
+```
+
+`assertArrayHasKey('status', $status)` is a real assertion on a computed
+return value, so it counts toward Category A (Outcome Verification) —
+correctly, by the analyzer's own rules. But the test never asserts *what*
+`$status['status']` actually is. A broken implementation that always
+returns `['status' => null]` would pass this test just as easily as a
+correct one. The gap is real; the analyzer's category system has no way
+to see it, because "asserted on the right key" and "asserted the key has
+the right value" look identical at the shape level it operates on.
+
+**Practical implication**: treat a passing/honest score as evidence a test
+touches real data, not as proof the test would catch a regression. For
+anything the analyzer scores as honest but that guards genuinely important
+behavior, still read the assertion body — the check above (does the test's
+assertion pin down a *value*, not just a key's presence or a type) is cheap
+to do by eye and catches what the tool structurally cannot.
+
 **Score Interpretation:**
 - **< 50%**: Test is hollow (only checks response, not logic)
 - **>= 50%**: Test is honest (touches most of its applicable categories, verifies behavior)
