@@ -16,11 +16,16 @@
  * suite of pure Unit tests over enums/value objects scores fairly
  * alongside a suite of HTTP Feature tests against a database.
  *
- * Categories B, D and E only apply to a test that does something they
- * could plausibly cover (I/O, a collaborator, shared state). A pure-logic
- * Unit test that touches none of that has those categories excluded from
- * its denominator rather than counted as missing — that's what stops a
- * Unit-test-heavy suite from being misread as mostly hollow.
+ * Categories B, D and E only apply to a test that does I/O, drives a
+ * collaborator, or touches shared state — a pure-logic Unit test with
+ * none of that has them excluded from its denominator rather than
+ * counted as missing. Category C only applies when the test is actually
+ * exercising a failure/rejection scenario (by name or by touching I/O
+ * that could fail) — a deliberate happy-path test, or an enum/value-
+ * object completeness check, isn't penalized for having no error to
+ * assert on. That's what stops a Unit-test-heavy suite, or a suite full
+ * of intentionally-narrow happy-path tests, from being misread as mostly
+ * hollow.
  *
  * Score = (applicable categories touched / applicable categories) x 100
  * Warns if score < 50%.
@@ -45,23 +50,31 @@ class TestHonestyAnalyzer
     // Categories that require some form of I/O or shared state to mean
     // anything. A pure-logic test that never touches any of that has
     // these excluded from its denominator instead of scored as failing.
-    private const CONDITIONAL_CATEGORIES = ['B', 'D', 'E'];
+    private const IO_CONDITIONAL_CATEGORIES = ['B', 'D', 'E'];
+
+    // Category C additionally applies whenever the test looks like it's
+    // exercising a failure/rejection path — by name or body — even with
+    // no I/O at all (e.g. a Unit test asserting a service method throws).
+    private $errorSignalPattern = '/\b(fails?|rejects?|invalid|error|exception|throws?|timeout|unauthorized|forbidden|denied|missing|not[\s_-]?found)\b/i';
 
     // Assertion-shape patterns per category. Matched against the raw
     // method body text, so they key on structure (an assertion comparing
     // to a property/array access, a foreign-key-shaped identifier, an
     // exception assertion) rather than any specific class, table, or
     // variable name.
+    //
+    // Category A uses a denylist, not an allowlist: Laravel, Livewire and
+    // Filament between them expose dozens of legitimate outcome-checking
+    // assertion methods (assertActionVisible, assertSee, assertSet,
+    // assertJsonFragment, assertViewHas, ...) that can't be enumerated by
+    // name without re-creating the original hardcoding problem one
+    // framework layer up. Anything named `assert*` counts as outcome
+    // evidence except the handful that prove nothing about program state
+    // on their own: a pure status/exception check (that's category C's
+    // job) or the assertTrue(true)/assertFalse(false) tautology.
     private $patterns = [
         'A' => [
-            '/assertDatabaseHas\s*\(/',
-            '/assertSame\s*\(\s*\$\w+\s*,\s*\$\w+(->|\[)/',
-            '/assertEquals\s*\(\s*\$\w+\s*,\s*\$\w+(->|\[)/',
-            '/assertTrue\s*\(\s*\$\w+->\w+\s*\(/',
-            '/assertFalse\s*\(\s*\$\w+->\w+\s*\(/',
-            '/assertInstanceOf\s*\(/',
-            '/assertObjectEquals\s*\(/',
-            '/assertEqualsCanonicalizing\s*\(/',
+            '/(?:\$this->|self::|->)\s*assert(?!Status\b|Ok\b|Created\b|NoContent\b|NotFound\b|Forbidden\b|Unauthorized\b|Unprocessable\b|ResponseStatusCode\b|Throws\w*\b)[A-Z]\w*\s*\(/',
         ],
         'B' => [
             '/assertDatabaseMissing\s*\(/',
@@ -107,6 +120,15 @@ class TestHonestyAnalyzer
             '/assertEmpty\s*\(/',
             '/\binvalid\b/i',
             '/non-?numeric/i',
+            '/\bnull\b/i',
+            '/\bmissing\b/i',
+            '/\bwithout\b/i',
+            '/\bempty\b/i',
+            '/\btimeout\b/i',
+            '/\bmalformed\b/i',
+            '/\bunauthorized\b/i',
+            '/fails?\s+to\b/i',
+            '/\brejects?\b/i',
         ],
     ];
 
@@ -164,7 +186,7 @@ class TestHonestyAnalyzer
                 $startPos = $matches[0][$i][1];
                 $testBody = $this->extractMethodBody($content, $startPos);
 
-                $analysis = $this->analyzeTest($testBody);
+                $analysis = $this->analyzeTest($testName, $testBody);
                 $this->results[$relPath . '::' . $testName] = [
                     'file' => $relPath,
                     'method' => $testName,
@@ -218,23 +240,55 @@ class TestHonestyAnalyzer
         return $testBody;
     }
 
-    private function analyzeTest($testBody)
+    // Categories whose signal is as likely to live in the test's name or
+    // a nearby comment as in assertion syntax (a boundary case or a
+    // concurrency scenario is often expressed there, not as a distinct
+    // assertion call) — searched against name+body together.
+    private const NAME_AWARE_CATEGORIES = ['E', 'F'];
+
+    private function analyzeTest($testName, $testBody)
     {
         $assertionCount = $this->countAssertions($testBody);
         $hasIO = (bool) preg_match($this->ioSignalPattern, $testBody);
+        $nameAndBody = str_replace('_', ' ', $testName) . "\n" . $testBody;
+        // Strip the two tautological calls before matching category A,
+        // so a test whose only "assertion" is assertTrue(true) doesn't
+        // get outcome-verification credit for it.
+        $bodyWithoutTautologies = preg_replace(
+            '/assert(True\s*\(\s*true|False\s*\(\s*false)\s*\)/',
+            '',
+            $testBody
+        );
 
         $categoriesUsed = [];
         $applicableCategories = [];
         $notApplicable = [];
 
-        foreach ($this->patterns as $category => $patterns) {
-            $touched = $this->matchesAny($testBody, $patterns);
-            $isConditional = in_array($category, self::CONDITIONAL_CATEGORIES, true);
+        $hasErrorSignal = (bool) preg_match($this->errorSignalPattern, $nameAndBody);
 
-            if ($isConditional && !$hasIO && !$touched) {
+        foreach ($this->patterns as $category => $patterns) {
+            if ($category === 'A') {
+                $searchText = $bodyWithoutTautologies;
+            } elseif (in_array($category, self::NAME_AWARE_CATEGORIES, true)) {
+                $searchText = $nameAndBody;
+            } else {
+                $searchText = $testBody;
+            }
+            $touched = $this->matchesAny($searchText, $patterns);
+
+            $applicable = true;
+            if (in_array($category, self::IO_CONDITIONAL_CATEGORIES, true) && !$hasIO && !$touched) {
                 // Nothing in this test could demonstrate a side effect,
-                // a relationship, or a concurrency guarantee — exclude
-                // the category rather than penalize its absence.
+                // a relationship, or a concurrency guarantee.
+                $applicable = false;
+            } elseif ($category === 'C' && !$hasIO && !$hasErrorSignal && !$touched) {
+                // Not testing a failure/rejection scenario at all — a
+                // deliberate happy-path or enum-completeness test isn't
+                // missing an error case it was never meant to have.
+                $applicable = false;
+            }
+
+            if (!$applicable) {
                 $notApplicable[] = $category;
                 continue;
             }
@@ -317,7 +371,7 @@ class TestHonestyAnalyzer
                 );
                 if ($analysis['categories_not_applicable']) {
                     $report[] = sprintf(
-                        "- **Not Applicable**: %s (no I/O or side effects in this test)",
+                        "- **Not Applicable**: %s (no I/O, side effects, or failure scenario in this test)",
                         implode(', ', $analysis['categories_not_applicable'])
                     );
                 }
